@@ -1,0 +1,425 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: gitlab-omnibusconfig
+  namespace: namespace-name
+data:
+  gitlab.rb: |
+    # Basic configuration
+    gitlab_rails['initial_root_password'] = File.read('/etc/secrets/rootpw')
+    gitlab_rails['gitlab_signup_enabled'] = false
+    gitlab_rails['lfs_enabled'] = true
+
+    # Main NGINX
+    external_url 'https://gitlab.domain.tld/'
+    letsencrypt['enable'] = false
+    nginx['listen_port'] = 80
+    nginx['listen_https'] = false
+
+    # PlantUML
+    nginx['custom_gitlab_server_config'] = "location /-/plantuml/ { \n    proxy_cache off; \n    proxy_pass  http://gitlab-plantuml:8080/; \n}\n"
+    gitlab_rails['env'] = { 'PLANTUML_ENCODING' => 'deflate' }
+
+    # SSH
+    gitlab_rails['gitlab_shell_ssh_port'] = 2244
+
+    # Registry
+    registry_external_url 'https://docker.domain.tld'
+    registry_nginx['listen_port'] = 8888
+    registry_nginx['listen_https'] = false
+
+    # Pages
+    gitlab_pages['inplace_chroot'] = true
+    pages_external_url 'https://docs.domain.tld'
+    pages_nginx['listen_port'] = 7777
+    pages_nginx['listen_https'] = false
+
+    # External PGSQL
+    postgresql['enable'] = false
+    gitlab_rails['db_database'] = 'gitlab'
+    gitlab_rails['db_host'] = 'gitlab-db'
+    gitlab_rails['db_port'] = '5432'
+    gitlab_rails['db_username'] = 'gitlab'
+    gitlab_rails['db_password'] = File.read('/etc/secrets/dbpw')
+
+    # External Redis
+    redis['enable'] = false
+    gitlab_rails['redis_host'] = "gitlab-kvdb"
+    gitlab_rails['redis_port'] = 6379
+    gitlab_rails['redis_password'] = File.read('/etc/secrets/kvdbpw')
+
+    # Identity provider
+    gitlab_rails['omniauth_enabled'] = true
+    gitlab_rails['omniauth_allow_single_sign_on'] = ['saml']
+    gitlab_rails['omniauth_block_auto_created_users'] = false
+    gitlab_rails['omniauth_auto_link_saml_user'] = true
+    gitlab_rails['omniauth_providers'] = [
+      {
+        "name" => "saml",
+        "label" => "IDP Label",
+        "groups_attribute" => "groups",
+        "admin_groups" => ['admin'],
+          "args" => {
+          "assertion_consumer_service_url" => 'https://gitlab.domain.tld/users/auth/saml/callback',
+          "idp_cert"=> "PLACEHOLDER",
+          "idp_sso_target_url"=> 'https://auth.domain.tld/auth/realms/namespace-name/protocol/saml/clients/gitlab.domain.tld',
+          "issuer"=> 'gitlab.domain.tld',
+          "name_identifier_format"=> 'urn:oasis:names:tc:SAML:2.0:nameid-format:persistent',
+          "attribute_statements"=> {
+            "first_name"=> ['first_name'],
+            "last_name"=> ['last_name'],
+            "name"=> ['cn'],
+            "usernamerratice"=> ['cn'],
+            "email"=> ['email']
+          }
+        }
+      }
+    ]
+
+    # SMTP Sendmail
+    gitlab_rails['gitlab_email_from'] = 'user@domain.tld'
+    gitlab_rails['gitlab_email_reply_to'] = 'user@domain.tld'
+    gitlab_rails['gitlab_email_display_name'] = 'Gitlab'
+    gitlab_rails['smtp_enable'] = true
+    gitlab_rails['smtp_address'] = "smtp.gmail.com"
+    gitlab_rails['smtp_port'] = 587
+    gitlab_rails['smtp_user_name'] = "user@domain.tld"
+    gitlab_rails['smtp_password'] = File.read('/etc/secrets/smtppw')
+    gitlab_rails['smtp_domain'] = "smtp.domain.tld"
+    gitlab_rails['smtp_authentication'] = "login"
+    gitlab_rails['smtp_enable_starttls_auto'] = true
+    gitlab_rails['smtp_tls'] = false
+    gitlab_rails['smtp_openssl_verify_mode'] = 'peer'
+
+    # Prometheus
+    prometheus_monitoring['enable'] = false
+
+    # Packages
+    gitlab_rails['packages_enabled'] = true
+
+---
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: gitlab-db
+  namespace: namespace-name
+spec:
+  selector:
+    matchLabels:
+      service: gitlab-db
+  template:
+    metadata:
+      labels:
+        service: gitlab-db
+    spec:
+      nodeSelector:
+        storageaccess: direct
+      volumes:
+      - name: gitlab-db
+        hostPath:
+          path: "/cluster/namespace-name/gitlab/db"
+          type: "DirectoryOrCreate"
+      containers:
+        - name: "gitlab-db"
+          image: "postgres:12.8"
+          env:
+          - name: POSTGRES_DATABASE
+            value: gitlab
+          - name: POSTGRES_USER
+            value: gitlab
+          - name: POSTGRES_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: gitlab-secrets
+                key: dbpw
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: gitlab-secrets
+                key: dbpw
+          volumeMounts:
+          - mountPath: "/var/lib/postgresql/data"
+            name: gitlab-db
+
+---
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: gitlab-kvdb
+  namespace: namespace-name
+spec:
+  selector:
+    matchLabels:
+      service: gitlab-kvdb
+  template:
+    metadata:
+      labels:
+        service: gitlab-kvdb
+    spec:
+      volumes:
+      - name: gitlab-kvdb
+        hostPath:
+          path: "/cluster/namespace-name/gitlab/kvdb"
+          type: "DirectoryOrCreate"
+      containers:
+        - name: "gitlab-kvdb"
+          image: "redis:latest"
+          args:
+          - --loglevel warning
+          - --requirepass $(REDIS_PASSWORD)
+          env:
+          - name: REDIS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: gitlab-secrets
+                key: kvdbpw
+          volumeMounts:
+          - mountPath: "/var/lib/redis"
+            name: gitlab-kvdb
+
+---
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: gitlab
+  namespace: namespace-name
+spec:
+  selector:
+    matchLabels:
+      service: gitlab
+  template:
+    metadata:
+      labels:
+        service: gitlab
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+              - key: performance
+                operator: In
+                values:
+                - high
+      volumes:
+      - name: gitlab-secrets
+        secret:
+          secretName: gitlab-secrets
+      - name: gitlab-omnibusconfig
+        configMap:
+          name: gitlab-omnibusconfig
+      - name: gitlab-data
+        hostPath:
+          path: "/cluster/namespace-name/gitlab/data"
+          type: "DirectoryOrCreate"
+      - name: gitlab-config
+        hostPath:
+          path: "/cluster/namespace-name/gitlab/config"
+          type: "DirectoryOrCreate"
+      - name: gitlab-pages
+        hostPath:
+          path: "/cluster/storage/shared/pages"
+          type: "DirectoryOrCreate"
+      - name: gitlab-packages
+        hostPath:
+          path: "/cluster/storage/namespace-name/gitlab/packages"
+          type: "DirectoryOrCreate"
+      - name: gitlab-logs
+        hostPath:
+          path: "/cluster/storage/namespace-name/gitlab/logs"
+          type: "DirectoryOrCreate"
+      - name: gitlab-lfs
+        hostPath:
+          path: "/cluster/storage/namespace-name/gitlab/lfs"
+          type: "DirectoryOrCreate"
+      - name: gitlab-registry
+        hostPath:
+          path: "/cluster/storage/namespace-name/gitlab/registry"
+          type: "DirectoryOrCreate"
+      - name: gitlab-backups
+        hostPath:
+          path: "/cluster/storage/namespace-name/gitlab/backups"
+          type: "DirectoryOrCreate"
+      containers:
+      - name: "gitlab"
+        image: "gitlab/gitlab-ce:14.1.5-ce.0"
+        env:
+        - name: GITLAB_OMNIBUS_CONFIG
+          value: "from_file('/etc/gitlab/omnibus/gitlab.rb')"
+        volumeMounts:
+        - mountPath: "/etc/gitlab/omnibus"
+          name: "gitlab-omnibusconfig"
+        - mountPath: "/var/opt/gitlab"
+          name: "gitlab-data"
+        - mountPath: "/var/log/gitlab"
+          name: "gitlab-logs"
+        - mountPath: "/etc/gitlab"
+          name: "gitlab-config"
+        - mountPath: "/var/opt/gitlab/gitlab-rails/shared/lfs-objects"
+          name: "gitlab-lfs"
+        - mountPath: "/var/opt/gitlab/gitlab-rails/shared/registry"
+          name: "gitlab-registry"
+        - mountPath: "/var/opt/gitlab/gitlab-rails/shared/pages"
+          name: "gitlab-pages"
+        - mountPath: "/var/opt/gitlab/gitlab-rails/shared/packages"
+          name: "gitlab-packages"
+        - mountPath: "/var/opt/gitlab/backups"
+          name: "gitlab-backups"
+        - mountPath: "/etc/secrets"
+          readOnly: true
+          name: "gitlab-secrets"
+        ports:
+        - name: ssh
+          containerPort: 22
+        - name: http
+          containerPort: 80
+        - name: http-docker
+          containerPort: 8888
+        - name: http-docs
+          containerPort: 7777
+
+---
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: gitlab-plantuml
+  namespace: namespace-name
+spec:
+  selector:
+    matchLabels:
+      service: gitlab-plantuml
+  template:
+    metadata:
+      labels:
+        service: gitlab-plantuml
+    spec:
+      containers:
+        - name: "gitlab-plantuml"
+          image: "plantuml/plantuml-server:tomcat-v1.2021.0"
+          ports:
+          - name: main
+            containerPort: 8080
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: gitlab-db
+  namespace: namespace-name
+spec:
+  selector:
+    service: gitlab-db
+  ports:
+  - protocol: TCP
+    port: 5432
+    name: db
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: gitlab-kvdb
+  namespace: namespace-name
+spec:
+  selector:
+    service: gitlab-kvdb
+  ports:
+  - protocol: TCP
+    port: 6379
+    name: db
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: gitlab
+  namespace: namespace-name
+spec:
+  selector:
+    service: gitlab
+  ports:
+  - protocol: TCP
+    port: 80
+    name: http
+  - protocol: TCP
+    port: 8888
+    name: http-docker
+  - protocol: TCP
+    port: 7777
+    name: http-docs
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: gitlab-ssh
+  namespace: namespace-name
+spec:
+  selector:
+    service: gitlab
+  type: NodePort
+  ports:
+  - protocol: TCP
+    port: 22
+    targetPort: 22
+    nodePort: 2244
+    name: ssh
+
+---
+
+kind: Service
+apiVersion: v1
+metadata:
+  name: gitlab-plantuml
+  namespace: namespace-name
+spec:
+  selector:
+    service: gitlab-plantuml
+  ports:
+  - protocol: TCP
+    port: 8080
+    name: main
+
+---
+
+kind: Ingress
+apiVersion: networking.k8s.io/v1beta1
+metadata:
+  name: gitlab
+  namespace: namespace-name
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.frontend.passHostHeader: "false"
+spec:
+  rules:
+  - host: gitlab.domain.tld
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: gitlab
+          servicePort: http
+  - host: docker.domain.tld
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: gitlab
+          servicePort: http-docker
+  - host: docs.domain.tld
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: gitlab
+          servicePort: http-docs
+

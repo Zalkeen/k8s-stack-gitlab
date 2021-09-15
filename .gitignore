@@ -1,0 +1,10 @@
+secrets.yml
+backups/
+config/
+data/
+db*/
+kvdb/
+lfs/
+logs/
+pages/
+registry/
